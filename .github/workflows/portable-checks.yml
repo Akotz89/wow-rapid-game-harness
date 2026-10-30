@@ -1,0 +1,25 @@
+name: Portable harness checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Check Python syntax
+        run: python -m compileall -q .
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+      - name: Check bootstrap shell syntax and lint
+        run: |
+          bash -n bootstrap
+          shellcheck -x bootstrap
