@@ -1,0 +1,265 @@
+--- a/client/world.go
++++ b/client/world.go
+@@ -1225,14 +1225,13 @@
+ func (w *WorldClient) Run() error {
+ 	// Read SMSG_AUTH_CHALLENGE
+ 	if err := w.handleAuthChallenge(); err != nil {
+-		// Close (not bare conn.Close): signalStop wakes WaitForSessionPhase waiters
+-		// immediately instead of burning the full authed timeout on phase "none".
+-		w.Close()
+-		return fmt.Errorf("auth challenge: %w", err)
++		return fmt.Errorf("auth challenge: %w", w.stopWithError(err))
+ 	}
+ 
+ 	// Run the packet reading loop (blocks until connection closes or error)
+ 	w.readLoop()
++	w.sendMu.Lock()
++	defer w.sendMu.Unlock()
+ 	return w.lastError
+ }
+ 
+@@ -1247,25 +1246,22 @@
+ 		return err
+ 	}
+ 
+-	size := binary.BigEndian.Uint16(header[0:2]) - 2
++	size := binary.BigEndian.Uint16(header[0:2])
+ 	opcode := binary.LittleEndian.Uint16(header[2:4])
+ 
+ 	if opcode != SmsgAuthChallenge {
+ 		return fmt.Errorf("expected SMSG_AUTH_CHALLENGE (0x%X), got 0x%X", SmsgAuthChallenge, opcode)
+ 	}
+ 
+-	data := make([]byte, size)
++	// Native challenge: uint32 + four-byte auth seed + 32 random bytes, plus opcode.
++	if size != 42 {
++		return fmt.Errorf("invalid auth challenge size %d (want 42)", size)
++	}
++	data := make([]byte, 40)
+ 	if _, err := io.ReadFull(w.readBuf, data); err != nil {
+ 		return err
+ 	}
+-
+-	// Parse: uint32(1) + authSeed(4 bytes) + randomBytes(32 bytes)
+-	r := bytes.NewReader(data)
+-	var one uint32
+-	binary.Read(r, binary.LittleEndian, &one)
+-
+-	authSeed := make([]byte, 4)
+-	r.Read(authSeed)
++	authSeed := data[4:8]
+ 
+ 	// Generate client seed
+ 	clientSeed := make([]byte, 4)
+@@ -1298,7 +1294,9 @@
+ 	addonData := buildMinimalAddonInfo()
+ 	buf.Write(addonData)
+ 
+-	w.sendPacketUnencrypted(CmsgAuthSession, buf.Bytes())
++	if err := w.sendPacketUnencrypted(CmsgAuthSession, buf.Bytes()); err != nil {
++		return fmt.Errorf("send auth session: %w", err)
++	}
+ 
+ 	// Set up encryption
+ 	w.setupEncryption()
+@@ -1357,9 +1355,12 @@
+ 	for {
+ 		opcode, data, err := w.readPacket()
+ 		if err != nil {
+-			if !w.stopped {
++			w.sendMu.Lock()
++			if w.lastError == nil && !w.stopped {
+ 				w.lastError = err
+ 			}
++			w.closeLocked()
++			w.sendMu.Unlock()
+ 			return
+ 		}
+ 
+@@ -1493,8 +1494,7 @@
+ 	w.sendMu.Lock()
+ 	defer w.sendMu.Unlock()
+ 
+-	_, err := w.conn.Write(append(header, data...))
+-	return err
++	return w.writePacketLocked(append(header, data...))
+ }
+ 
+ func (w *WorldClient) sendPacket(opcode uint16, data []byte) error {
+@@ -1510,17 +1510,39 @@
+ 	w.sendMu.Lock()
+ 	defer w.sendMu.Unlock()
+ 
+-	if w.conn == nil {
+-		return fmt.Errorf("not connected")
++	if w.stopped || w.conn == nil {
++		return fmt.Errorf("not connected or stopped")
+ 	}
+ 
+ 	if w.encrypted {
+ 		w.encryptClient.XORKeyStream(header, header)
+ 	}
+ 
+-	packet := append(header, data...)
+-	_, err := w.conn.Write(packet)
+-	return err
++	return w.writePacketLocked(append(header, data...))
++}
++
++// writePacketLocked never reuses an uncertain stream, especially after cipher advancement.
++func (w *WorldClient) writePacketLocked(packet []byte) error {
++	if w.stopped || w.conn == nil {
++		return fmt.Errorf("not connected or stopped")
++	}
++	err := w.conn.SetWriteDeadline(time.Now().Add(4 * time.Second))
++	if err == nil {
++		var n int
++		n, err = w.conn.Write(packet)
++		if err == nil && n != len(packet) {
++			err = io.ErrShortWrite
++		}
++	}
++	if err != nil {
++		if w.lastError == nil {
++			w.lastError = fmt.Errorf("write world packet: %w", err)
++		}
++		w.closeLocked()
++		w.signalStop()
++		return w.lastError
++	}
++	return nil
+ }
+ 
+ func (w *WorldClient) handlePacket(opcode uint16, data []byte) {
+@@ -1729,8 +1751,7 @@
+ 		// WaitForSessionPhase unblocks and LoginBot can Close+retry without
+ 		// burning the full authed timeout on a dead crypto session.
+ 		w.log("Auth response failed with code %d — closing", result)
+-		w.lastError = fmt.Errorf("world auth failed with code %d", result)
+-		w.Close()
++		w.stopWithError(fmt.Errorf("world auth failed with code %d", result))
+ 		return
+ 	}
+ 
+@@ -1878,7 +1899,9 @@
+ 
+ func (w *WorldClient) handleLogoutComplete() {
+ 	w.log("Logout complete")
++	w.sendMu.Lock()
+ 	w.stopped = true
++	w.sendMu.Unlock()
+ 	w.setPhase(PhaseLogout, "SMSG_LOGOUT_COMPLETE")
+ 	select {
+ 	case <-w.logoutDone:
+@@ -1959,12 +1982,47 @@
+ // WaitForLogin waits until the SMSG_LOGIN_VERIFY_WORLD has arrived (signaling successful world entry
+ // after LoginCharacter). It is safe to call multiple times.
+ func (w *WorldClient) WaitForLogin(timeout time.Duration) error {
++	if err := w.loginStopError(); err != nil {
++		return err
++	}
++	timer := time.NewTimer(timeout)
++	defer timer.Stop()
+ 	select {
+ 	case <-w.loginDone:
+-		return nil
+-	case <-time.After(timeout):
++		return w.loginStopError()
++	case <-w.stopChan:
++		return w.loginStopError()
++	case <-timer.C:
++		if err := w.loginStopError(); err != nil {
++			return err
++		}
+ 		return fmt.Errorf("timeout waiting for login verify world")
+ 	}
++}
++
++func (w *WorldClient) loginStopError() error {
++	if err := w.StopError(); err != nil {
++		return fmt.Errorf("client stopped while waiting for login verify world: %w", err)
++	}
++	return nil
++}
++
++// StopError returns the first terminal cause, or nil if no stop is known.
++// Both the stopped bit and channel matter during Close's signal publication gap.
++func (w *WorldClient) StopError() error {
++	w.sendMu.Lock()
++	defer w.sendMu.Unlock()
++	select {
++	case <-w.stopChan:
++	default:
++		if !w.stopped {
++			return nil
++		}
++	}
++	if w.lastError != nil {
++		return w.lastError
++	}
++	return fmt.Errorf("client stopped")
+ }
+ 
+ // SetActiveMover sends CMSG_SET_ACTIVE_MOVER
+@@ -2229,7 +2287,17 @@
+ 	case <-time.After(timeout):
+ 		return fmt.Errorf("logout timeout")
+ 	case <-w.stopChan:
+-		return w.lastError
++		select {
++		case <-w.logoutDone:
++			return nil
++		default:
++		}
++		w.sendMu.Lock()
++		defer w.sendMu.Unlock()
++		if w.lastError != nil {
++			return w.lastError
++		}
++		return fmt.Errorf("client stopped before logout complete")
+ 	}
+ }
+ 
+@@ -2343,12 +2411,33 @@
+ 	return w.stopped || w.conn == nil
+ }
+ 
++// stopWithError publishes the first cause and invalidates the stream atomically.
++func (w *WorldClient) stopWithError(err error) error {
++	w.sendMu.Lock()
++	if w.lastError == nil && !w.stopped {
++		w.lastError = err
++	}
++	if w.lastError != nil {
++		err = w.lastError
++	}
++	w.closeLocked()
++	w.sendMu.Unlock()
++	w.signalStop()
++	return err
++}
++
+ // Close closes the connection and unblocks any pending reads.
+ // Always signals stopChan (once) so waiters wake on hard disconnect.
+ func (w *WorldClient) Close() {
+ 	// Flush learn batch while logFunc is still set.
+ 	w.FlushLearnedSpellLog()
+ 	w.sendMu.Lock()
++	w.closeLocked()
++	w.sendMu.Unlock()
++	w.signalStop()
++}
++
++func (w *WorldClient) closeLocked() {
+ 	w.stopped = true
+ 	// Drop t.Logf-backed logger first so late readLoop packets cannot panic with
+ 	// "Log in goroutine after TestX has completed" after t.Cleanup runs.
+@@ -2357,8 +2446,6 @@
+ 		// Closing the conn will unblock any ReadFull in readPacket/readLoop.
+ 		_ = w.conn.Close()
+ 	}
+-	w.sendMu.Unlock()
+-	w.signalStop()
+ }
+ 
+ // StopChan returns the channel that is closed when the connection stops

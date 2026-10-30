@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export GIT_NO_REPLACE_OBJECTS=1
+root="$(cd -- "$(dirname -- "$0")/../.." && pwd)"
+"$root/scripts/wow-build-host-guard"
+base="$root/tools/rapid-game-harness"
+revision=34b756fce55ed82decb737bd9b808d7aec4e537b
+source="$root/work/rapid-game-harness-20261012/azerothghost"
+dep="$base/.deps/azerothghost"
+mkdir -p "$base/.deps"
+if [[ ! -d "$dep/.git" ]]; then
+    if [[ -d "$source/.git" ]] && git -C "$source" cat-file -e "$revision^{commit}"; then
+        git clone --quiet --shared --no-checkout "$source" "$dep"
+    else
+        git clone --quiet --no-checkout https://github.com/azerothcore/AzerothGhost.git "$dep"
+    fi
+    git -C "$dep" checkout --quiet --detach "$revision"
+fi
+[[ "$(git -C "$dep" rev-parse HEAD)" == "$revision" ]] || { echo 'Dependency revision mismatch' >&2; exit 1; }
+git -C "$dep" diff --cached --quiet || { echo 'Unexpected staged dependency changes' >&2; exit 1; }
+# Materialize the pinned tree independently of index flags and ignore rules.
+tmp="$(mktemp -d "$base/.deps/verify.XXXXXXXX")"
+trap 'rm -rf -- "$tmp"' EXIT
+python3 "$base/verify_dependency.py" --materialize "$dep" "$tmp" "$revision"
+git init --quiet "$tmp"
+(cd "$tmp" && git apply "$base/auth-os.patch" "$base/session-exact-name.patch" "$base/world-transport.patch" "$base/client-session-phase.patch")
+python3 "$base/verify_dependency.py" "$dep" "$tmp" "$revision"
+printf 'Pinned AzerothGhost %s; exact auth OS, requested-name, world transport and session phase patches verified\n' "$revision"

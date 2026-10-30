@@ -1,0 +1,60 @@
+--- a/client/session.go
++++ b/client/session.go
+@@ -120,33 +120,50 @@
+ // WaitForSessionPhase blocks until SessionPhase equals want, or timeout.
+ // Driven by phase transitions (SMSG_AUTH_RESPONSE, LOGIN_VERIFY_WORLD, teleports, …).
+ func (w *WorldClient) WaitForSessionPhase(want SessionPhase, timeout time.Duration) error {
++	stopError := func() error {
++		if err := w.StopError(); err != nil {
++			return fmt.Errorf("client stopped while waiting for session phase %s: %w", want, err)
++		}
++		return nil
++	}
++	if err := stopError(); err != nil {
++		return err
++	}
+ 	if w.SessionPhase() == want {
+-		return nil
++		return stopError()
+ 	}
+ 	ch := make(chan SessionPhase, 16)
+ 	w.phaseMu.Lock()
+ 	w.phaseWaiters = append(w.phaseWaiters, ch)
+ 	// Recheck under lock so we cannot miss a transition that happened after the first check.
+-	if w.phase == want {
+-		w.phaseMu.Unlock()
+-		w.removePhaseWaiter(ch)
+-		return nil
+-	}
++	matched := w.phase == want
+ 	w.phaseMu.Unlock()
+ 	defer w.removePhaseWaiter(ch)
++	if matched {
++		return stopError()
++	}
++	if err := stopError(); err != nil {
++		return err
++	}
+ 
+ 	timer := time.NewTimer(timeout)
+ 	defer timer.Stop()
+ 	for {
+ 		select {
+ 		case p := <-ch:
++			if err := stopError(); err != nil {
++				return err
++			}
+ 			if p == want {
+ 				return nil
+ 			}
+ 		case <-timer.C:
++			if err := stopError(); err != nil {
++				return err
++			}
+ 			return fmt.Errorf("timeout waiting for session phase %s (have %s)", want, w.SessionPhase())
+ 		case <-w.stopChan:
+-			return fmt.Errorf("client stopped while waiting for session phase %s", want)
++			return stopError()
+ 		}
+ 	}
+ }

@@ -1,0 +1,124 @@
+--- a/e2e/e2eharness/session.go
++++ b/e2e/e2eharness/session.go
+@@ -156,17 +156,41 @@
+ 	if err := w.WaitForSessionPhase(client.PhaseAuthed, 20*time.Second); err != nil {
+ 		return nil, fmt.Errorf("wait authed: %w", err)
+ 	}
+-	_ = w.SendReadyForAccountDataTimes()
+-	_ = w.SendRealmSplit()
++	sessionError := func(stage string, err error) error {
++		if stopped := w.StopError(); stopped != nil {
++			err = stopped
++		}
++		if err != nil {
++			return fmt.Errorf("%s: %w", stage, err)
++		}
++		return nil
++	}
++	if err := w.SendReadyForAccountDataTimes(); err != nil {
++		return nil, sessionError("account data times", err)
++	}
++	if err := w.SendRealmSplit(); err != nil {
++		return nil, sessionError("realm split", err)
++	}
+ 	if err := w.RequestCharList(); err != nil {
+-		return nil, fmt.Errorf("char enum: %w", err)
++		return nil, sessionError("char enum", err)
+ 	}
+ 
+ 	var chars []client.CharEnumEntry
++	if err := sessionError("char enum", nil); err != nil {
++		return nil, err
++	}
+ 	select {
+ 	case chars = <-charListCh:
++	case <-w.StopChan():
++		return nil, sessionError("char enum", nil)
+ 	case <-time.After(15 * time.Second):
++		if err := sessionError("char enum", nil); err != nil {
++			return nil, err
++		}
+ 		return nil, fmt.Errorf("timeout char enum")
++	}
++	if err := sessionError("char enum", nil); err != nil {
++		return nil, err
+ 	}
+ 
+ 	// Login isolation: only enter the character matching opt.CharName.
+@@ -189,7 +213,7 @@
+ 				opt.User, charName, len(chars), chars[0].Name)
+ 		}
+ 		// Names must be pure letters (digits => CHAR_NAME_MIXED_LANGUAGES 0x5D).
+-		names := UniqueLetterNames(charName, 24)
++		names := []string{charName}
+ 		var created bool
+ 		for _, tryName := range names {
+ 			select {
+@@ -197,15 +221,25 @@
+ 			default:
+ 			}
+ 			if err := w.CreateCharacter(tryName, opt.Race, opt.Class, 0, 1, 1, 1, 1, 1, 0); err != nil {
+-				return nil, fmt.Errorf("create char: %w", err)
++				return nil, sessionError("create char", err)
+ 			}
+ 			var code uint8
++			if err := sessionError("creating requested character; re-enumerate on retry", nil); err != nil {
++				return nil, err
++			}
+ 			select {
+ 			case code = <-createCh:
++			case <-w.StopChan():
++				return nil, sessionError("creating requested character; re-enumerate on retry", nil)
+ 			case <-time.After(20 * time.Second):
+-				// Under multi-bot load the create ACK can lag; try next name.
+-				t.Logf("%s timeout char create result for %s — trying next name", opt.User, tryName)
+-				continue
++				if err := sessionError("creating requested character; re-enumerate on retry", nil); err != nil {
++					return nil, err
++				}
++				// Unknown outcome: the next LoginBot call re-enumerates this exact name.
++				return nil, fmt.Errorf("timeout creating requested character; re-enumerate on retry")
++			}
++			if err := sessionError("creating requested character; re-enumerate on retry", nil); err != nil {
++				return nil, err
+ 			}
+ 			t.Logf("%s create %s result=0x%02X", opt.User, tryName, code)
+ 			// 0x2F = CHAR_CREATE_SUCCESS on 3.3.5a
+@@ -216,16 +250,27 @@
+ 			}
+ 		}
+ 		if !created {
+-			return nil, fmt.Errorf("character create failed for all names")
++			return nil, fmt.Errorf("requested character creation failed")
+ 		}
+ 		// SMSG_CHAR_CREATE already arrived; re-enum for GUID (wait on SMSG_CHAR_ENUM).
+ 		if err := w.RequestCharList(); err != nil {
++			return nil, sessionError("char enum after create", err)
++		}
++		if err := sessionError("char enum after create", nil); err != nil {
+ 			return nil, err
+ 		}
+ 		select {
+ 		case chars = <-charListCh:
++		case <-w.StopChan():
++			return nil, sessionError("char enum after create", nil)
+ 		case <-time.After(15 * time.Second):
++			if err := sessionError("char enum after create", nil); err != nil {
++				return nil, err
++			}
+ 			return nil, fmt.Errorf("timeout char enum after create")
++		}
++		if err := sessionError("char enum after create", nil); err != nil {
++			return nil, err
+ 		}
+ 		for _, c := range chars {
+ 			if strings.EqualFold(c.Name, charName) {
+@@ -242,7 +287,7 @@
+ 	bs.Name = charName
+ 
+ 	if err := w.LoginCharacter(guid); err != nil {
+-		return nil, fmt.Errorf("login: %w", err)
++		return nil, sessionError("login", err)
+ 	}
+ 	// WaitForLogin is closed on SMSG_LOGIN_VERIFY_WORLD (PhaseInWorld).
+ 	if err := w.WaitForLogin(60 * time.Second); err != nil {
